@@ -1,5 +1,5 @@
 target   := nanoarch
-sources  := nanoarch.c
+sources  := frontend_extensions.c charmap.c nanoarch.c
 CFLAGS   := -Wall -O2 -g
 LDFLAGS  := -static-libgcc
 LIBS     := -ldl

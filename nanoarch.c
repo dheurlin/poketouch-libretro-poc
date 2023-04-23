@@ -7,12 +7,16 @@
 #include <dlfcn.h>
 
 #include "libretro.h"
+#include "libretro_extensions.h"
+#include "charmap.h"
+#include "common.h"
+#include "frontend_extensions.h"
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <alsa/asoundlib.h>
 
-static GLFWwindow *g_win = NULL;
+GLFWwindow *g_win = NULL;
 static snd_pcm_t *g_pcm = NULL;
 static float g_scale = 3;
 
@@ -52,7 +56,7 @@ static struct {
 	void (*retro_get_system_av_info)(struct retro_system_av_info *info);
 	void (*retro_set_controller_port_device)(unsigned port, unsigned device);
 	void (*retro_reset)(void);
-	void (*retro_run)(void);
+	unsigned (*retro_run)(void);
 	size_t (*retro_serialize_size)(void);
 	bool (*retro_serialize)(void *data, size_t size);
 	bool (*retro_unserialize)(const void *data, size_t size);
@@ -65,7 +69,6 @@ static struct {
 //	void *retro_get_memory_data(unsigned id);
 //	size_t retro_get_memory_size(unsigned id);
 } g_retro;
-
 
 struct keymap {
 	unsigned k;
@@ -89,14 +92,7 @@ struct keymap g_binds[] = {
 	{ 0, 0 }
 };
 
-static unsigned g_joy[RETRO_DEVICE_ID_JOYPAD_R3+1] = { 0 };
-
-#define load_sym(V, S) do {\
-	if (!((*(void**)&V) = dlsym(g_retro.handle, #S))) \
-		die("Failed to load symbol '" #S "'': %s", dlerror()); \
-	} while (0)
-#define load_retro_sym(S) load_sym(g_retro.S, S)
-
+unsigned g_joy[RETRO_DEVICE_ID_JOYPAD_R3+1] = { 0 };
 
 static void die(const char *fmt, ...) {
 	char buffer[4096];
@@ -230,6 +226,7 @@ static bool video_set_pixel_format(unsigned format) {
 	if (g_video.tex_id)
 		die("Tried to change pixel format after initialization.");
 
+  printf("Retro pixel format: %u\n", format);
 	switch (format) {
 	case RETRO_PIXEL_FORMAT_0RGB1555:
 		g_video.pixfmt = GL_UNSIGNED_SHORT_5_5_5_1;
@@ -319,6 +316,10 @@ static size_t audio_write(const void *buf, unsigned frames) {
 	if (!g_pcm)
 		return 0;
 
+  // if (frames < 1) {
+  //   return 0;
+  // }
+
 	int written = snd_pcm_writei(g_pcm, buf, frames);
 
 	if (written < 0) {
@@ -378,6 +379,12 @@ static bool core_environment(unsigned cmd, void *data) {
 		*(const char **)data = ".";
 		return true;
 
+  case RETRO_ENVIRONMENT_SET_MEMORY_MAPS: {
+    struct retro_memory_map *desc = data;
+    set_memory_map_pointers(desc);
+    return true;
+  }
+
 	default:
 		core_log(RETRO_LOG_DEBUG, "Unhandled env #%u", cmd);
 		return false;
@@ -395,8 +402,15 @@ static void core_video_refresh(const void *data, unsigned width, unsigned height
 
 static void core_input_poll(void) {
 	int i;
-	for (i = 0; g_binds[i].k || g_binds[i].rk; ++i)
+	for (i = 0; g_binds[i].k || g_binds[i].rk; ++i) {
 		g_joy[g_binds[i].rk] = (glfwGetKey(g_win, g_binds[i].k) == GLFW_PRESS);
+  }
+
+  // g_joy[RETRO_DEVICE_ID_JOYPAD_R2] = ff_enabled;
+
+  if (*input_override_cb) {
+    (*input_override_cb)();
+  }
 
 	// Quit nanoarch when pressing the Escape key.
 	if (glfwGetKey(g_win, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
@@ -460,6 +474,10 @@ static void core_load(const char *sofile) {
 	load_sym(set_input_state, retro_set_input_state);
 	load_sym(set_audio_sample, retro_set_audio_sample);
 	load_sym(set_audio_sample_batch, retro_set_audio_sample_batch);
+
+  load_sym(set_PC_breakpoint_, ext_set_PC_breakpoint);
+  load_sym(clear_PC_breakpoints, ext_clear_PC_breakpoints);
+  load_sym(get_program_counter, ext_get_program_counter);
 
 	set_environment(core_environment);
 	set_video_refresh(core_video_refresh);
@@ -558,6 +576,8 @@ int main(int argc, char *argv[]) {
 		free(saveblob);
 	}
 
+  setup_breakpoints();
+
 	while (!glfwWindowShouldClose(g_win)) {
 		glfwPollEvents();
 
@@ -566,7 +586,12 @@ int main(int argc, char *argv[]) {
 			g_retro.retro_reset();
 		}
 
-		g_retro.retro_run();
+		unsigned res = g_retro.retro_run();
+
+    if (res == BREAKPOINT_HIT) {
+      // CHECK BREAKPOINTS
+      handle_breakpoint();
+    }
 
 		glClear(GL_COLOR_BUFFER_BIT);
 
